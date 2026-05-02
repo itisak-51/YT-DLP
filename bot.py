@@ -9,29 +9,18 @@
 import os
 import re
 import sys
-import json
 import time
 import asyncio
 import logging
-import tempfile
-import threading
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
 import yt_dlp
 from dotenv import load_dotenv
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    BotCommand, InputMediaAudio, InputMediaVideo,
-    Message
-)
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters,
-    ConversationHandler
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.constants import ParseMode, ChatAction
 from telegram.error import TelegramError
 
@@ -56,32 +45,22 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8"),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("bot.log", encoding="utf-8")],
 )
 logger = logging.getLogger("ytdlp_bot")
 
 # ─── Global State ────────────────────────────────────────────────────────────
-active_downloads: dict[int, dict] = {}   # chat_id -> {url, task, status, ...}
+active_downloads: dict[int, dict] = {}
 user_download_count: dict[int, int] = defaultdict(int)
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 bot_stats = {"total_downloads": 0, "total_audio": 0, "total_video": 0,
              "total_playlist": 0, "start_time": datetime.now()}
 
-# ─── Emojis & Text ───────────────────────────────────────────────────────────
+# ─── Emojis ─────────────────────────────────────────────────────────────────
 E = {
-    "dl":      "⬇️", "audio":   "🎵", "video":   "🎬",
-    "list":    "📋", "check":   "✅", "cross":   "❌",
-    "wait":    "⏳", "fire":    "🔥", "rocket":  "🚀",
-    "warn":    "⚠️", "info":    "ℹ️", "star":    "⭐",
-    "folder":  "📁", "size":    "📦", "time":    "⏱️",
-    "bar":     "▓", "bar_e":   "░", "pin":     "📌",
-    "thumb":   "👍", "heart":   "❤️", "wave":    "👋",
-    "chart":   "📊", "gear":    "⚙️", "cancel":  "🚫",
-    "link":    "🔗", "quality": "🎞️", "music":   "🎧",
-    "crown":   "👑", "clock":   "🕐", "disk":    "💿",
+    "dl": "⬇️", "audio": "🎵", "video": "🎬", "list": "📋", "check": "✅", "cross": "❌",
+    "wait": "⏳", "rocket": "🚀", "warn": "⚠️", "info": "ℹ️", "size": "📦",
+    "time": "⏱️", "bar": "▓", "bar_e": "░", "cancel": "🚫", "quality": "🎞️",
 }
 
 PROGRESS_BAR_LEN = 10
@@ -91,13 +70,13 @@ def make_progress_bar(percent: float) -> str:
     return E["bar"] * filled + E["bar_e"] * (PROGRESS_BAR_LEN - filled)
 
 def fmt_size(bytes_: int) -> str:
-    if bytes_ < 1024:       return f"{bytes_} B"
-    elif bytes_ < 1048576:  return f"{bytes_/1024:.1f} KB"
+    if bytes_ < 1024: return f"{bytes_} B"
+    elif bytes_ < 1048576: return f"{bytes_/1024:.1f} KB"
     elif bytes_ < 1073741824: return f"{bytes_/1048576:.1f} MB"
     return f"{bytes_/1073741824:.2f} GB"
 
 def fmt_duration(sec: int) -> str:
-    if sec < 60:    return f"{sec}s"
+    if sec < 60: return f"{sec}s"
     elif sec < 3600: return f"{sec//60}m {sec%60}s"
     return f"{sec//3600}h {(sec%3600)//60}m"
 
@@ -108,45 +87,51 @@ def fmt_uptime() -> str:
     return f"{h}h {m}m {s}s"
 
 def is_youtube_url(url: str) -> bool:
-    patterns = [
-        r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/",
-        r"(https?://)?(music\.youtube\.com)/",
-    ]
+    patterns = [r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/", r"(https?://)?(music\.youtube\.com)/"]
     return any(re.search(p, url) for p in patterns)
 
 def is_playlist_url(url: str) -> bool:
     return "list=" in url or "/playlist" in url
-
-def sanitize_filename(name: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "_", name)[:100]
 
 def check_access(user_id: int) -> bool:
     if not RESTRICTED_MODE:
         return True
     return user_id in ALLOWED_USERS or user_id in ADMIN_IDS
 
-# ─── YT-DLP Helpers ──────────────────────────────────────────────────────────
+# ─── YT-DLP Helpers (Improved for 2026) ─────────────────────────────────────
 def get_ydl_opts_base() -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
         "cookiefile": str(COOKIES_FILE) if COOKIES_FILE.exists() else None,
+        "extractor_args": {"youtube": {"player_client": ["android", "web", "ios"]}},
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+        "http_headers": {"Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.youtube.com/"},
+        "socket_timeout": 30,
+        "retries": 3,
     }
     if PROXY:
         opts["proxy"] = PROXY
     return opts
 
 def get_video_info(url: str) -> Optional[dict]:
-    opts = {**get_ydl_opts_base(), "skip_download": True, "extract_flat": False}
+    opts = {**get_ydl_opts_base(), "skip_download": True, "extract_flat": False, "ignoreerrors": True}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
     except Exception as e:
         logger.error(f"Info error: {e}")
-        return None
+        # Fallback
+        try:
+            opts["extractor_args"] = {"youtube": {"player_client": ["ios", "android", "web"]}}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as e2:
+            logger.error(f"Fallback failed: {e2}")
+            return None
 
 def get_playlist_info(url: str) -> Optional[dict]:
-    opts = {**get_ydl_opts_base(), "skip_download": True, "extract_flat": True}
+    opts = {**get_ydl_opts_base(), "skip_download": True, "extract_flat": True, "ignoreerrors": True}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
@@ -159,17 +144,13 @@ def get_available_formats(info: dict) -> list[dict]:
     seen = set()
     result = []
     for f in formats:
-        vcodec = f.get("vcodec", "none")
-        acodec = f.get("acodec", "none")
-        height = f.get("height")
-        ext    = f.get("ext", "")
-        if vcodec != "none" and height and height not in seen:
+        if f.get("vcodec") != "none" and (height := f.get("height")) and height not in seen:
             seen.add(height)
             result.append({
                 "label": f"{height}p",
                 "height": height,
                 "format_id": f.get("format_id"),
-                "ext": ext,
+                "ext": f.get("ext", ""),
                 "filesize": f.get("filesize") or f.get("filesize_approx"),
             })
     result.sort(key=lambda x: x["height"], reverse=True)
@@ -178,18 +159,14 @@ def get_available_formats(info: dict) -> list[dict]:
 # ─── Keyboards ───────────────────────────────────────────────────────────────
 def kb_main_menu(is_playlist: bool = False) -> InlineKeyboardMarkup:
     rows = [
-        [
-            InlineKeyboardButton(f"{E['audio']} Audio MP3",  callback_data="dl_audio"),
-            InlineKeyboardButton(f"{E['video']} Best Video", callback_data="dl_video_best"),
-        ],
-        [
-            InlineKeyboardButton(f"{E['quality']} Choose Quality", callback_data="dl_quality"),
-        ],
+        [InlineKeyboardButton(f"{E['audio']} Audio MP3", callback_data="dl_audio"),
+         InlineKeyboardButton(f"{E['video']} Best Video", callback_data="dl_video_best")],
+        [InlineKeyboardButton(f"{E['quality']} Choose Quality", callback_data="dl_quality")],
     ]
     if is_playlist:
         rows.append([
-            InlineKeyboardButton(f"{E['list']} Playlist Audio",  callback_data="pl_audio"),
-            InlineKeyboardButton(f"{E['list']} Playlist Video",  callback_data="pl_video"),
+            InlineKeyboardButton(f"{E['list']} Playlist Audio", callback_data="pl_audio"),
+            InlineKeyboardButton(f"{E['list']} Playlist Video", callback_data="pl_video"),
         ])
     rows.append([InlineKeyboardButton(f"{E['cross']} Cancel", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
@@ -200,80 +177,54 @@ def kb_quality(formats: list) -> InlineKeyboardMarkup:
         row = []
         for f in formats[i:i+2]:
             size_str = f" ({fmt_size(f['filesize'])})" if f.get("filesize") else ""
-            row.append(InlineKeyboardButton(
-                f"{E['quality']} {f['label']}{size_str}",
-                callback_data=f"quality_{f['height']}"
-            ))
+            row.append(InlineKeyboardButton(f"{E['quality']} {f['label']}{size_str}", callback_data=f"quality_{f['height']}"))
         rows.append(row)
     rows.append([InlineKeyboardButton(f"{E['cross']} Cancel", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
 
 def kb_playlist_options(count: int) -> InlineKeyboardMarkup:
     rows = [
-        [
-            InlineKeyboardButton(f"{E['audio']} All as MP3 ({count})", callback_data="pl_audio"),
-            InlineKeyboardButton(f"{E['video']} All as MP4 ({count})", callback_data="pl_video"),
-        ],
+        [InlineKeyboardButton(f"{E['audio']} All as MP3 ({count})", callback_data="pl_audio"),
+         InlineKeyboardButton(f"{E['video']} All as MP4 ({count})", callback_data="pl_video")],
         [InlineKeyboardButton(f"{E['cross']} Cancel", callback_data="cancel")],
     ]
     return InlineKeyboardMarkup(rows)
 
-# ─── Progress Hook Factory ────────────────────────────────────────────────────
-def make_progress_hook(chat_id: int, msg_id: int, context: ContextTypes.DEFAULT_TYPE,
-                       title: str = "", loop: asyncio.AbstractEventLoop = None):
+# ─── Progress Hook ───────────────────────────────────────────────────────────
+def make_progress_hook(chat_id: int, msg_id: int, context: ContextTypes.DEFAULT_TYPE, title: str = ""):
     last_update = [0.0]
-
     def hook(d):
         nonlocal last_update
-        now = time.time()
-        if now - last_update[0] < 3:
+        if time.time() - last_update[0] < 3:
             return
-        last_update[0] = now
+        last_update[0] = time.time()
 
         if d["status"] == "downloading":
             downloaded = d.get("downloaded_bytes", 0)
-            total      = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            speed      = d.get("speed") or 0
-            eta        = d.get("eta") or 0
-            percent    = (downloaded / total * 100) if total else 0
-            bar        = make_progress_bar(percent)
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            speed = d.get("speed") or 0
+            eta = d.get("eta") or 0
+            percent = (downloaded / total * 100) if total else 0
+            bar = make_progress_bar(percent)
 
-            text = (
-                f"{E['dl']} <b>Downloading...</b>\n\n"
-                f"🎯 <b>{title[:40]}</b>\n\n"
-                f"<code>[{bar}] {percent:.1f}%</code>\n\n"
-                f"{E['size']} <b>Size:</b> {fmt_size(downloaded)}"
-                + (f" / {fmt_size(total)}" if total else "") + "\n"
-                f"{E['rocket']} <b>Speed:</b> {fmt_size(int(speed))}/s\n"
-                f"{E['clock']} <b>ETA:</b> {fmt_duration(int(eta))}"
-            )
-            if loop:
-                asyncio.run_coroutine_threadsafe(
-                    _edit_message(context, chat_id, msg_id, text), loop
-                )
-
-        elif d["status"] == "finished":
-            text = f"{E['check']} <b>Download complete!</b> Processing..."
-            if loop:
-                asyncio.run_coroutine_threadsafe(
-                    _edit_message(context, chat_id, msg_id, text), loop
-                )
+            text = (f"{E['dl']} <b>Downloading...</b>\n\n"
+                    f"🎯 <b>{title[:40]}</b>\n\n"
+                    f"<code>[{bar}] {percent:.1f}%</code>\n\n"
+                    f"{E['size']} <b>Size:</b> {fmt_size(downloaded)}" + (f" / {fmt_size(total)}" if total else "") +
+                    f"\n{E['rocket']} <b>Speed:</b> {fmt_size(int(speed))}/s\n"
+                    f"{E['time']} <b>ETA:</b> {fmt_duration(int(eta))}")
+            asyncio.create_task(_edit_message(context, chat_id, msg_id, text))
 
     return hook
 
 async def _edit_message(context, chat_id, msg_id, text):
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id, message_id=msg_id,
-            text=text, parse_mode=ParseMode.HTML
-        )
-    except TelegramError:
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, parse_mode=ParseMode.HTML)
+    except Exception:
         pass
 
-# ─── Download Functions ───────────────────────────────────────────────────────
-async def download_audio(url: str, chat_id: int, msg_id: int,
-                         context: ContextTypes.DEFAULT_TYPE,
-                         title: str = "") -> Optional[Path]:
+# ─── Download Functions ─────────────────────────────────────────────────────
+async def download_audio(url: str, chat_id: int, msg_id: int, context: ContextTypes.DEFAULT_TYPE, title: str = "") -> Optional[Path]:
     loop = asyncio.get_event_loop()
     out_tmpl = str(DOWNLOAD_DIR / f"{chat_id}_%(id)s.%(ext)s")
     opts = {
@@ -286,34 +237,25 @@ async def download_audio(url: str, chat_id: int, msg_id: int,
             {"key": "EmbedThumbnail"},
         ],
         "writethumbnail": True,
-        "progress_hooks": [make_progress_hook(chat_id, msg_id, context, title, loop)],
+        "progress_hooks": [make_progress_hook(chat_id, msg_id, context, title)],
     }
     try:
         async with download_semaphore:
-            loop2 = asyncio.get_event_loop()
-            info = await loop2.run_in_executor(None, lambda: _run_download(url, opts))
+            info = await loop.run_in_executor(None, lambda: _run_download(url, opts))
             if not info:
                 return None
-            # Find the downloaded mp3
             vid_id = info.get("id", "")
             for f in DOWNLOAD_DIR.glob(f"{chat_id}_{vid_id}*.mp3"):
                 return f
-            # Fallback search
             for f in sorted(DOWNLOAD_DIR.glob(f"{chat_id}_*.mp3"), key=lambda x: x.stat().st_mtime, reverse=True):
                 return f
     except Exception as e:
         logger.error(f"Audio download error: {e}")
     return None
 
-async def download_video(url: str, chat_id: int, msg_id: int,
-                         context: ContextTypes.DEFAULT_TYPE,
-                         title: str = "", height: int = 0) -> Optional[Path]:
+async def download_video(url: str, chat_id: int, msg_id: int, context: ContextTypes.DEFAULT_TYPE, title: str = "", height: int = 0) -> Optional[Path]:
     loop = asyncio.get_event_loop()
-    if height:
-        fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
-    else:
-        fmt = "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
-
+    fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best" if height else "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
     out_tmpl = str(DOWNLOAD_DIR / f"{chat_id}_%(id)s.%(ext)s")
     opts = {
         **get_ydl_opts_base(),
@@ -321,12 +263,11 @@ async def download_video(url: str, chat_id: int, msg_id: int,
         "outtmpl": out_tmpl,
         "merge_output_format": "mp4",
         "postprocessors": [{"key": "FFmpegMetadata"}],
-        "progress_hooks": [make_progress_hook(chat_id, msg_id, context, title, loop)],
+        "progress_hooks": [make_progress_hook(chat_id, msg_id, context, title)],
     }
     try:
         async with download_semaphore:
-            loop2 = asyncio.get_event_loop()
-            info = await loop2.run_in_executor(None, lambda: _run_download(url, opts))
+            info = await loop.run_in_executor(None, lambda: _run_download(url, opts))
             if not info:
                 return None
             vid_id = info.get("id", "")
