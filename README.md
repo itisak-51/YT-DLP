@@ -25,8 +25,7 @@ A feature-rich Telegram bot for downloading YouTube videos and audio with playli
 
 ```bash
 # 1. Clone or copy the bot files to your server
-mkdir -p ~/ytdlp-bot && cd ~/ytdlp-bot
-# (copy all files here)
+git clone https://github.com/itisak-51/yt-dlp.git && cd ~/yt-dlp
 
 # 2. Set your Bot Token in .env
 nano .env
